@@ -1,0 +1,218 @@
+pipeline {
+    agent any
+    
+    tools {
+        nodejs 'node24'   
+    }
+
+    environment {
+        MONGO_URI          = "mongodb://superuser:superpassword@localhost:27017/admin"
+        MONGO_DB_Creds     = credentials('mongo-db-credentials')
+        MONGO_USERNAME     = credentials('mongo-db-username')
+        MONGO_PASSWORD     = credentials('mongo-db-password')
+        SONAR_SCANNER_HOME = tool 'sonarqube-scanner-720'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'feture/cicd', url: 'https://github.com/jaysh-rob/solar-system-jenkins.git'
+            }
+        }
+        
+        stage('Install Dependency') {
+            steps {
+                sh 'npm install --no-audit'
+            }
+        }
+        
+        stage('Dependency Scanning') {
+            parallel {
+                stage('NPM Dependency Audit') {
+                    steps {
+                        sh 'npm audit --audit-level=critical'
+                    }
+                }
+        
+                stage('OWASP Dependency Check') {
+                    steps {
+                        dependencyCheck additionalArguments: '''
+                            --scan ./ \
+                            --out ./ \
+                            --format ALL \
+                            --prettyPrint \
+                            --disableYarnAudit
+                            ''', odcInstallation: 'dc12'
+                        
+                        publishHTML([allowMissing: false,
+                                     alwaysLinkToLastBuild: true,
+                                     keepAll: true,
+                                     reportDir: '.',
+                                     reportFiles: 'dependency-check-report.html',
+                                     reportName: 'Dependency Check HTML Report'])
+
+                        junit allowEmptyResults: true,
+                              testResults: 'dependency-check-junit.xml'
+
+                        dependencyCheckPublisher pattern: 'dependency-check-report.xml',
+                                                 unstableTotalCritical: 1
+                    }
+                }
+            }
+        }
+
+        stage('Unit Testing') {
+            steps {
+                catchError(buildResult: 'SUCCESS', message: 'Opps! It will be fixed in future') {
+                    sh 'echo Colon-Separated - $MONGO_DB_Creds'
+                    sh 'echo Username - $MONGO_DB_Creds_USR'
+                    sh 'echo Password - $MONGO_DB_Creds_PSW'
+                    sh 'npm test'
+                }
+            }
+        }
+
+        stage('Code Coverage') {
+            steps {
+                catchError(buildResult: 'SUCCESS',
+                           message: 'Oops! It will be fixed in future releases',
+                           stageResult: 'UNSTABLE') {
+                    sh 'npm run coverage'
+                }
+                publishHTML([allowMissing: true,
+                             alwaysLinkToLastBuild: true,
+                             keepAll: true,
+                             reportDir: 'coverage/lcov-report',
+                             reportFiles: 'index.html',
+                             reportName: 'Code Coverage HTML Report'])
+            }
+        }
+
+        stage('SAST - SonarQube') {
+            steps {
+                timeout(time: 60, unit: 'SECONDS') {
+                    withSonarQubeEnv('sonar-qube-server') {
+                        sh '''
+                            $SONAR_SCANNER_HOME/bin/sonar-scanner \
+                            -Dsonar.projectKey=solar-system-project \
+                            -Dsonar.sources=app.js \
+                            -Dsonar.javascript.lcov.reportPaths=./coverage/lcov.info
+                        '''
+                    }
+                }
+                waitForQualityGate abortPipeline: true
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t jackdhub/solar-system:$BUILD_NUMBER .'
+            }
+        }
+
+        stage('Trivy Vulnerability Scanner') {
+            steps {
+                options { timeout(time: 45, unit: 'MINUTES') }
+                sh '''
+                    echo "Running Trivy scan for LOW and MEDIUM severity issues..."
+                    trivy image jackdhub/solar-system:$BUILD_NUMBER \
+                        --severity LOW,MEDIUM \
+                        --exit-code 0 \
+                        --quiet \
+                        --format json -o trivy-image-MEDIUM-results.json
+
+                    echo "Running Trivy scan for CRITICAL severity issues..."
+                    trivy image jackdhub/solar-system:$BUILD_NUMBER \
+                        --severity CRITICAL \
+                        --exit-code 1 \
+                        --quiet \
+                        --format json -o trivy-image-CRITICAL-results.json
+                '''
+            }
+        }
+        
+        stage('Push Docker image') {
+            steps {
+                withDockerRegistry([credentialsId: 'dockerhub-credentials', url: 'https://index.docker.io/v1/']) {
+                    sh 'docker push jackdhub/solar-system:$BUILD_NUMBER'
+                }
+            }
+        }
+        
+        stage('Deploy -AWS EC2') {
+            // when {
+            //     branch 'feture/*'
+            // }
+            steps {
+                 script {
+                    sshagent(['aws-dev-deploy-ec2-instance']) {
+                        sh '''
+                            ssh -o StrictHostKeyChecking=no ubuntu@13.200.215.238 "
+                                if sudo docker ps -a | grep -q 'solar-system'; then
+                                    echo 'Container found. Stopping...'
+                                    sudo docker stop solar-system && sudo docker rm solar-system
+                                    echo 'Container stopped and removed.'
+                                fi
+                
+                                sudo docker run --name solar-system \\
+                                    -e MONGO_URI=$MONGO_URI \\
+                                    -e MONGO_USERNAME=$MONGO_USERNAME \\
+                                    -e MONGO_PASSWORD=$MONGO_PASSWORD \\
+                                    -p 3000:3000 -d jackdhub/solar-system:$BUILD_NUMBER
+                            "
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    // post {
+    //     always {
+    //         // Convert Trivy JSON reports into HTML and JUnit XML
+    //         sh '''
+    //             echo "Converting Trivy JSON reports into HTML and JUnit XML..."
+
+    //           trivy convert --format template \
+    //           --template "@/usr/local/share/trivy/templates/junit.tpl" \
+    //           --output trivy-image-CRITICAL-results.xml trivy-image-CRITICAL-results.json
+
+    //             trivy convert --format template \
+    //           --template "@/usr/local/share/trivy/templates/junit.tpl" \
+    //           --output trivy-image-MEDIUM-results.xml trivy-image-MEDIUM-results.json
+
+    //             trivy convert --format template --template @junit-nonempty.tpl \
+    //             --output trivy-image-CRITICAL-results.xml trivy-image-CRITICAL-results.json
+
+    //             trivy convert --format template --template @junit-nonempty.tpl \
+    //             --output trivy-image-MEDIUM-results.xml trivy-image-MEDIUM-results.json
+    //         '''
+
+    //         junit allowEmptyResults: true, testResults: 'test-results.xml'
+    //         junit allowEmptyResults: true, testResults: 'dependency-check-junit.xml'
+    //         junit allowEmptyResults: true, testResults: 'trivy-image-CRITICAL-results.xml'
+    //         junit allowEmptyResults: true, testResults: 'trivy-image-MEDIUM-results.xml'
+
+    //         publishHTML([allowMissing: true,
+    //                      alwaysLinkToLastBuild: true,
+    //                      keepAll: true,
+    //                      reportDir: 'coverage/lcov-report',
+    //                      reportFiles: 'index.html',
+    //                      reportName: 'Code Coverage HTML Report'])
+
+    //         publishHTML([allowMissing: true,
+    //                      alwaysLinkToLastBuild: true,
+    //                      keepAll: true,
+    //                      reportDir: '.',
+    //                      reportFiles: 'trivy-image-CRITICAL-results.html',
+    //                      reportName: 'Trivy Image Critical Vul Report'])
+
+    //         publishHTML([allowMissing: true,
+    //                      alwaysLinkToLastBuild: true,
+    //                      keepAll: true,
+    //                      reportDir: '.',
+    //                      reportFiles: 'trivy-image-MEDIUM-results.html',
+    //                      reportName: 'Trivy Image Medium Vul Report'])
+    //     }
+    // }
+}
